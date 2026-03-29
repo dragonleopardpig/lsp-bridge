@@ -5,6 +5,7 @@
   "settings": {},
   "projectFiles": ["Cargo.toml"],
   "orgBabelVirtualFile": "org_examples/src/main.rs",
+  "orgBabelWrapTemplate": "fn main() {\n%s\n}\n",
   "capabilities": {
     "textDocument": {
       "hover": {

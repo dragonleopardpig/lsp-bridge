@@ -30,6 +30,9 @@
 (defvar-local lsp-bridge-org-babel--info-cache nil)
 (defvar-local lsp-bridge-org-babel--block-bop nil)
 (defvar-local lsp-bridge-org-babel--block-eop nil)
+(defvar-local lsp-bridge-org-babel--virtual-block-ranges nil)
+(defvar-local lsp-bridge-org-babel--virtual-line-bias 0)
+(defvar-local lsp-bridge-org-babel--current-block-global-line-bias 0)
 (defvar-local lsp-bridge-org-babel--update-file-before-change nil)
 
 (defun lsp-bridge-org-babel-in-block-p (pos)
@@ -43,7 +46,94 @@
   "Clean org babel cache."
   (setq-local lsp-bridge-org-babel--info-cache nil)
   (setq-local lsp-bridge-org-babel--block-bop nil)
-  (setq-local lsp-bridge-org-babel--block-eop nil))
+  (setq-local lsp-bridge-org-babel--block-eop nil)
+  (setq-local lsp-bridge-org-babel--virtual-block-ranges nil)
+  (setq-local lsp-bridge-org-babel--virtual-line-bias 0)
+  (setq-local lsp-bridge-org-babel--current-block-global-line-bias 0))
+
+(defun lsp-bridge-org-babel--normalize-lang-name (info)
+  "Return normalized language name for src block INFO."
+  (let* ((lang (nth 0 info))
+         (lang (if (and (stringp lang)
+                        (string-prefix-p "jupyter-" lang))
+                   (substring lang (length "jupyter-"))
+                 lang))
+         (org-src-lang (cdr (assoc lang org-src-lang-modes))))
+    (if org-src-lang
+        (symbol-name org-src-lang)
+      (format "%s" lang))))
+
+(defun lsp-bridge-org-babel--normalized-session (info)
+  "Return normalized session identifier for src block INFO."
+  (let ((session (cdr (assq :session (nth 2 info)))))
+    (cond
+     ((or (null session)
+          (equal session "none")
+          (equal session "nil"))
+      nil)
+     ((stringp session) session)
+     (t (format "%s" session)))))
+
+(defun lsp-bridge-org-babel--src-block-body-range (block)
+  "Return cons of body begin/end positions for src BLOCK."
+  (save-excursion
+    (goto-char (org-element-property :post-affiliated block))
+    (let ((bop (1+ (line-end-position)))
+          (eop nil))
+      (setq eop (+ bop -1 (length (org-element-property :value block))))
+      (cons bop eop))))
+
+(defun lsp-bridge-org-babel--block-content (range)
+  "Return source text for block RANGE."
+  (let ((begin (car range))
+        (end (cdr range)))
+    (if (> end begin)
+        (buffer-substring-no-properties begin end)
+      "")))
+
+(defun lsp-bridge-org-babel--collect-virtual-block-ranges (current-info)
+  "Collect previous compatible src blocks plus CURRENT-INFO."
+  (let* ((current-begin (org-element-property :begin current-info))
+         (current-lang (lsp-bridge-org-babel--normalize-lang-name
+                        (org-babel-get-src-block-info 'light)))
+         (current-session (lsp-bridge-org-babel--normalized-session
+                           (org-babel-get-src-block-info 'light)))
+         (ranges '())
+         (line-bias 0))
+    (org-element-map (org-element-parse-buffer) 'src-block
+      (lambda (block)
+        (let ((block-begin (org-element-property :begin block)))
+          (when (<= block-begin current-begin)
+            (save-excursion
+              (goto-char block-begin)
+              (let ((info (org-babel-get-src-block-info 'light)))
+                (when (and (equal (lsp-bridge-org-babel--normalize-lang-name info)
+                                  current-lang)
+                           (equal (lsp-bridge-org-babel--normalized-session info)
+                                  current-session))
+                  (let* ((range (lsp-bridge-org-babel--src-block-body-range block))
+                         (content (lsp-bridge-org-babel--block-content range)))
+                    (setq ranges (append ranges (list range)))
+                    (unless (= block-begin current-begin)
+                      (setq line-bias (+ line-bias (cl-count ?\n content)))
+                      (unless (or (string-empty-p content)
+                                  (string-suffix-p "\n" content))
+                        (setq line-bias (1+ line-bias))))))))))))
+    (setq-local lsp-bridge-org-babel--virtual-line-bias line-bias)
+    ranges))
+
+(defun lsp-bridge-org-babel-get-buffer-content ()
+  "Return the virtual LSP document content for the current Org src block."
+  (when lsp-bridge-org-babel--virtual-block-ranges
+    (mapconcat
+     (lambda (range)
+       (let ((content (lsp-bridge-org-babel--block-content range)))
+         (if (or (string-empty-p content)
+                 (string-suffix-p "\n" content))
+             content
+           (concat content "\n"))))
+     lsp-bridge-org-babel--virtual-block-ranges
+     "")))
 
 (defun lsp-bridge-org-babel-check-lsp-server ()
   "Check if current point is in org babel block. "
@@ -55,9 +145,14 @@
         (setq-local lsp-bridge-org-babel--info-cache nil)
       (save-excursion
         (goto-char (org-element-property :post-affiliated lsp-bridge-org-babel--info-cache))
-        (setq-local lsp-bridge-org-babel--block-bop (1+ (point-at-eol))))
+        (setq-local lsp-bridge-org-babel--block-bop (1+ (point-at-eol)))
+        (setq-local lsp-bridge-org-babel--current-block-global-line-bias
+                    (1- (line-number-at-pos lsp-bridge-org-babel--block-bop t))))
       (setq-local lsp-bridge-org-babel--block-eop (+ lsp-bridge-org-babel--block-bop -1
                                                      (length (org-element-property :value lsp-bridge-org-babel--info-cache))))
+      (setq-local lsp-bridge-org-babel--virtual-block-ranges
+                  (lsp-bridge-org-babel--collect-virtual-block-ranges
+                   lsp-bridge-org-babel--info-cache))
       ;; sync it in `lsp-bridge-monitor-before-change'
       (setq-local lsp-bridge-org-babel--update-file-before-change t)))
 
@@ -66,11 +161,9 @@
 
 (defun lsp-bridge-org-babel-get-single-lang-server ()
   "Get single lang server for org block."
-  (let* ((lang (org-element-property :language lsp-bridge-org-babel--info-cache)) ;get language name in src block
-         (org-src-lang (cdr (assoc lang org-src-lang-modes))) ;find match language name from `org-src-lang-modes'
-         (lang-name (if org-src-lang
-                        (symbol-name org-src-lang) ;convert to symbol name if found in `org-src-lang-modes'
-                      (format "%s" lang))) ;otherwise use src block name
+  (let* ((lang (org-element-property :language lsp-bridge-org-babel--info-cache))
+         (lang-name (lsp-bridge-org-babel--normalize-lang-name
+                     (list lang nil nil)))
          (mode-name (concat lang-name "-mode"))
          (major-mode (intern mode-name))
          (langserver-info
@@ -101,7 +194,8 @@
              lsp-bridge-org-babel--update-file-before-change)
     (setq-local lsp-bridge-org-babel--update-file-before-change nil)
     (lsp-bridge-call-file-api "update_file" (buffer-name)
-                              (1- (line-number-at-pos lsp-bridge-org-babel--block-bop t)))))
+                              (- lsp-bridge-org-babel--current-block-global-line-bias
+                                 lsp-bridge-org-babel--virtual-line-bias))))
 
 (provide 'lsp-bridge-org-babel)
 ;;; lsp-bridge-org-babel.el ends here

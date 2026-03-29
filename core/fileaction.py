@@ -78,6 +78,7 @@ class FileAction:
 
         self.org_file = os.path.splitext(filepath)[-1] == '.org'
         self.org_line_bias = None
+        self.org_template_prefix_lines = 0
 
         self.pull_diagnostic_timer = None
         self.last_diagnostic_version = None
@@ -120,6 +121,21 @@ class FileAction:
         self.insert_spaces = not self.insert_spaces
 
         self.set_lsp_server()
+
+    def _org_babel_wrap_template(self):
+        if not self.org_file or not self.single_server_info:
+            return None
+        return self.single_server_info.get("orgBabelWrapTemplate")
+
+    def _wrap_org_babel_content(self, content):
+        template = self._org_babel_wrap_template()
+        self.org_template_prefix_lines = 0
+        if not template or "%s" not in template:
+            return content
+
+        prefix, _ = template.split("%s", 1)
+        self.org_template_prefix_lines = prefix.count("\n")
+        return template % content
 
     def set_lsp_server(self):
         """Set LSP handlers, prefix and name """
@@ -202,6 +218,9 @@ class FileAction:
                 return
             start['line'] -= self.org_line_bias
             end['line'] -= self.org_line_bias
+            if self.org_template_prefix_lines:
+                start['line'] += self.org_template_prefix_lines
+                end['line'] += self.org_template_prefix_lines
             if start['line'] < 0 or end['line'] < 0:
                 logger.warning(
                     "Skip incremental org didChange with invalid rebased range: "
@@ -222,6 +241,7 @@ class FileAction:
             elif lsp_server.text_document_sync == 1:
                 if not buffer_content:
                     buffer_content = get_buffer_content(self.filepath, buffer_name)
+                    buffer_content = self._wrap_org_babel_content(buffer_content)
                 lsp_server.send_whole_change_notification(self.filepath, self.version, buffer_content)
             else:
                 lsp_server.send_did_change_notification(self.filepath, self.version, start, end, range_length, change_text)
@@ -257,6 +277,7 @@ class FileAction:
     def update_file(self, buffer_name, org_line_bias=None):
         self.org_line_bias = org_line_bias
         buffer_content = get_buffer_content(self.filepath, buffer_name)
+        buffer_content = self._wrap_org_babel_content(buffer_content)
         for lsp_server in self.get_lsp_servers():
             lsp_server.send_whole_change_notification(self.filepath, self.version, buffer_content)
         self.version += 1
@@ -299,6 +320,8 @@ class FileAction:
             if self.org_line_bias is None:
                 return
             position['line'] -= self.org_line_bias
+            if self.org_template_prefix_lines:
+                position['line'] += self.org_template_prefix_lines
 
         if version is None:
             version = self.version

@@ -1151,7 +1151,7 @@ So we build this macro to restore postion after code format."
     (if (and lsp-bridge-enable-org-babel
              (eq major-mode 'org-mode) (not no-org-babel))
         (and lsp-bridge-org-babel--info-cache
-             (org-element-property :value lsp-bridge-org-babel--info-cache))
+             (lsp-bridge-org-babel-get-buffer-content))
       (with-current-buffer buf
         (buffer-substring-no-properties (point-min) (point-max))))))
 
